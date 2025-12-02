@@ -6,6 +6,7 @@ import zipfile
 import sqlite3
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
+from pathlib import Path  # NEW
 
 import numpy as np
 import pandas as pd
@@ -14,7 +15,12 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
-DB_PATH = "smartdiv.db"
+# ------------------------------------------------------------------
+# DB PATH NOW ANCHORED TO THIS FILE'S FOLDER (WORKS ON CLOUD & LOCAL)
+# ------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "smartdiv.db"
+
 TRADING_DAYS = 252
 
 # -----------------------------------------------------------------------------
@@ -78,8 +84,12 @@ BBG_TICKERS = [
 # 2. DATABASE HELPERS
 # -----------------------------------------------------------------------------
 
+@st.cache_resource
 def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+    """Return a shared SQLite connection (cached per process)."""
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
 
 
 def init_db():
@@ -121,7 +131,6 @@ def init_db():
         if col not in existing_cols:
             c.execute(f"ALTER TABLE analyses ADD COLUMN {col} {coltype}")
     conn.commit()
-    conn.close()
 
 
 def save_analysis_row(
@@ -176,17 +185,13 @@ def save_analysis_row(
         ),
     )
     conn.commit()
-    conn.close()
 
 
 def load_analyses() -> pd.DataFrame:
     conn = get_conn()
-    try:
-        df = pd.read_sql_query(
-            "SELECT * FROM analyses ORDER BY datetime(created_at) DESC", conn
-        )
-    finally:
-        conn.close()
+    df = pd.read_sql_query(
+        "SELECT * FROM analyses ORDER BY datetime(created_at) DESC", conn
+    )
     return df
 
 
@@ -696,20 +701,36 @@ def page_analysis(user_name: str, role: str):
         # ------------------------ CHARTS --------------------------------------
         st.markdown("## Comparison charts")
 
-        # 1) Bar chart by chosen metric
-        primary_metric = st.selectbox(
+        # 1) Bar chart by chosen metric – NOW SUPPORTS ALL KEY METRICS
+        metric_options = {
+            "Sharpe": "Sharpe",
+            "Sortino": "Sortino",
+            "Annual return": "Ann Return",
+            "Volatility": "Volatility",
+            "Max drawdown": "Max Drawdown",
+            "CVaR": "CVaR",
+            f"Beta vs {primary_benchmark}": f"Beta vs {primary_benchmark}",
+            "RSI(14)": "RSI(14)",
+        }
+
+        metric_label = st.selectbox(
             "Choose metric for bar chart",
-            options=["Sharpe", "Sortino", "Ann Return", "Volatility", "Max Drawdown", "CVaR"],
+            options=list(metric_options.keys()),
             index=0,
             key="chart_metric_sel",
         )
-        fig_bar = px.bar(
-            metrics_df.reset_index(),
-            x="Fund",
-            y=primary_metric,
-            title=f"{primary_metric} by Fund",
-        )
-        st.plotly_chart(fig_bar, use_container_width=True)
+        metric_col = metric_options[metric_label]
+
+        if metric_col not in metrics_df.columns:
+            st.warning(f"Metric '{metric_label}' not available in metrics table.")
+        else:
+            fig_bar = px.bar(
+                metrics_df.reset_index(),
+                x="Fund",
+                y=metric_col,
+                title=f"{metric_label} by Fund",
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
 
         # 2) Risk/return scatter
         fig_scatter = px.scatter(
@@ -743,45 +764,8 @@ def page_analysis(user_name: str, role: str):
         fig_cum.update_layout(yaxis_title="Index (100 = start)", legend=dict(orientation="h"))
         st.plotly_chart(fig_cum, use_container_width=True)
 
-        # 5) Example candlestick + RSI for a selected fund
-        st.markdown("### Technical view (candlestick + RSI)")
-        tech_fund = st.selectbox(
-            "Choose fund for technical view",
-            options=list(prices_df.columns),
-            key="tech_fund_sel",
-        )
-        p = prices_df[tech_fund]
-        # build OHLC from close only (simple, not exact OHLC but ok for visualization)
-        ohlc = pd.DataFrame(
-            {
-                "Open": p.shift(1),
-                "High": p.rolling(3).max(),
-                "Low": p.rolling(3).min(),
-                "Close": p,
-            }
-        ).dropna()
-        fig_candle = go.Figure(
-            data=[
-                go.Candlestick(
-                    x=ohlc.index,
-                    open=ohlc["Open"],
-                    high=ohlc["High"],
-                    low=ohlc["Low"],
-                    close=ohlc["Close"],
-                    name=tech_fund,
-                )
-            ]
-        )
-        fig_candle.update_layout(title=f"{tech_fund} – pseudo candlestick")
-        st.plotly_chart(fig_candle, use_container_width=True)
-
-        rsi_plot = rsi_series(p)
-        fig_rsi = go.Figure()
-        fig_rsi.add_trace(go.Scatter(x=rsi_plot.index, y=rsi_plot, mode="lines", name="RSI(14)"))
-        fig_rsi.add_hline(y=70, line_dash="dash")
-        fig_rsi.add_hline(y=30, line_dash="dash")
-        fig_rsi.update_layout(title=f"{tech_fund} – RSI(14)")
-        st.plotly_chart(fig_rsi, use_container_width=True)
+        # NOTE: Technical view (candlestick + RSI) REMOVED
+        # because RSI Framework page provides full technical view.
 
         # Download metrics
         st.download_button(
@@ -815,7 +799,12 @@ def page_rsi_framework(user_name: str, role: str):
     else:
         default_funds = list(metrics_df.index)
 
-    fund = st.selectbox("Choose fund for RSI Executable analysis", options=list(prices_df.columns), index=0, key="rsi_exec_fund")
+    fund = st.selectbox(
+        "Choose fund for RSI Executable analysis",
+        options=list(prices_df.columns),
+        index=0,
+        key="rsi_exec_fund",
+    )
 
     price = prices_df[fund]
     status, explanation = rsi_executable_status(price)
@@ -905,7 +894,7 @@ def page_guide():
    • A clear **recommendation** appears at the top.  
 
 7. **Explore charts**  
-   • Bar charts, risk/return scatter, correlation heatmap, cumulative returns, candlestick and RSI.  
+   • Bar charts, risk/return scatter, correlation heatmap, cumulative returns.  
    • Download full metrics as CSV if needed.
 """
     )
@@ -967,7 +956,7 @@ def page_admin():
         return
 
     st.markdown("### Full history of analyses")
-    st.dataframe(df)
+    st.dataframe(df, use_container_width=True)
 
     st.markdown("### Download")
     st.download_button(
